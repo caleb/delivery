@@ -1,5 +1,5 @@
 {
- :host "mysite.com"
+ :host "example.com"
  :user "caleb"
- :run-list ["recipe[mysite::default]"]
+ :run-list ["recipe[example::default]"]
 }
