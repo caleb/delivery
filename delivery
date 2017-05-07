@@ -1,13 +1,15 @@
 #!/usr/bin/env boot
 
 (set-env! :dependencies '[[me.raynes/conch "0.8.0"]
+                          [org.clojure/core.incubator "0.1.4"]
                           [org.clojure/clojure "1.9.0-alpha16"]])
 (require '[me.raynes.conch :refer [with-programs]]
          '[me.raynes.conch.low-level :as sh]
          '[clojure.edn :as edn]
          '[clojure.string :as string]
          '[clojure.spec.alpha :as s]
-         '[clojure.java.io :refer [file]]
+         '[clojure.core.strint :refer [<<]]
+         '[clojure.java.io :refer [file spit]]
          '[boot.cli :refer [defclifn]])
 
 ;;
@@ -35,8 +37,9 @@
   ([message data cause]
    (throw (ex-info message (merge {::message message} data) cause))))
 
-(defn file-exists? [path]
-  (.exists (file path)))
+(defn write-if-missing [f contents]
+  (when-not (.exists (file f))
+    (spit f contents)))
 
 (defn command-exists? [cmd]
   (try
@@ -45,31 +48,6 @@
       true)
     (catch clojure.lang.ExceptionInfo e
       false)))
-
-(defn ruby-bin [project-dir command & opts]
-  (try
-     (with-programs [env bundle]
-       (let [gemfile (file project-dir "Gemfile")
-             opts (into (vec opts) [{:dir project-dir}])]
-         (if (.exists gemfile)
-           (println (apply bundle "exec" command opts))
-           (println (apply env command opts)))))
-     (catch clojure.lang.ExceptionInfo e
-       (let [command-line (string/join " " (into [command] opts))
-             output (string/join "\n" (-> (ex-data e) :proc :err))
-             msg (str "Error running ruby command: " command-line "\n" output)]
-         (throw (runtime-error msg (ex-data e) e))))))
-
-(defn berks [project-dir]
-  (let [berksfile (file project-dir "Berksfile")
-        gemfile   (file project-dir "Gemfile")]
-    (if (and (.exists berksfile) (or (command-exists? "berks")
-                                     (command-exists? "bundle")))
-      (with-programs [bundle berks rm]
-        (rm {:dir project-dir} "-rf" "site-cookbooks")
-        (cond
-          (.exists gemfile) (bundle "exec" "berks" "vendor" "site-cookbooks" {:dir project-dir})
-          :else             (berks "vendor" "site-cookbooks" {:dir project-dir}))))))
 
 (defn config-error [explain-data]
   (str "Expected "
@@ -96,14 +74,37 @@
       (validate-config f config-edn))
     (runtime-error (str "Configuration file \"" f "\" doesn't exist"))))
 
+(defn create-context [options args]
+  (let [config-file (file (or (:config options)))
+        project-dir (.. config-file getAbsoluteFile getParent)
+        config      (read-config config-file)]
+    {:command     (first args)
+     :args        (rest args)
+     :host        (or (:host options) (:host config))
+     :port        (or (:port options) (:port config))
+     :run-list    (or (:run-list options) (:run-list config))
+     :user        (or (:user options) (:user config))
+     :config-file config-file
+     :project-dir project-dir}))
+
 (defmulti task (fn [command & args] command))
 (defmethod task :init
-  [command options]
+  [options args]
   (println "INIT")
-  (println (ruby-bin (:project-dir options) "berks" "init" (:project-dir options))))
+  (let [command      (first args)
+        target-dir   (second args)
+        project-dir  (file target-dir)
+        project-name (.getName project-dir)]
+    (write-if-missing (file (:project-dir context) "Policyfile.rb")
+                      (<< "name '~{project-name}'\n"
+                          "run_list '~{project-name::default}'\n"
+                          "default_source :supermarket\n"
+                          "cookbook '~{project-name}', '~> 0.1.0', path: 'cookbooks/~{project-name}'"))))
+
 (defmethod task :deploy
-  [command options]
-  (println "DEPLOY"))
+  [options args]
+  (let [context (create-context options args)]
+    (println "DEPLOY")))
 
 (defclifn -main
   "A simple server provisioning tool using Chef Zero"
@@ -113,26 +114,14 @@
    r run-list RUN_LIST str "the run-list to execute on HOST"
    u user USER str "the user to deploy as (default root)"]
   (try
-    (let [command (-> (first *args*) keyword)]
+    (let [command (-> (first *args*) keyword)
+          options {:host host
+                   :port port
+                   :config config
+                   :run-list run-list
+                   :user user}]
       (if (get-method task command)
-        (let [config-file (file (or config "delivery.edn"))
-              project-dir (.. config-file getAbsoluteFile getParent)
-              config      (read-config config-file)]
-          (let [host     (or host (:host config))
-                port     (or port (:port config) 22)
-                run-list (or run-list (:run-list config))
-                user     (or user (:user config) "root")
-
-                options {:host        host
-                         :port        port
-                         :run-list    run-list
-                         :user        user
-                         :project-dir project-dir
-                         :config-file config-file}]
-            (println (str "Deploying to " host ":" port))
-            (println "Deploying as" user)
-            (println "Project dir" project-dir)
-            (task command options)))
+        (task options *args*)
         (*usage*)))
     (catch clojure.lang.ExceptionInfo e
       (let [d (-> e ex-data)]
