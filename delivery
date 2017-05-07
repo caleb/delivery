@@ -2,7 +2,8 @@
 
 (set-env! :dependencies '[[me.raynes/conch "0.8.0"]
                           [org.clojure/clojure "1.9.0-alpha16"]])
-(require '[me.raynes.conch :refer [with-programs] :as sh]
+(require '[me.raynes.conch :refer [with-programs]]
+         '[me.raynes.conch.low-level :as sh]
          '[clojure.edn :as edn]
          '[clojure.string :as string]
          '[clojure.spec.alpha :as s]
@@ -30,7 +31,9 @@
    (runtime-error message {}))
   ([message data]
    (throw (ex-info message (merge {::message message}
-                                  data)))))
+                                  data))))
+  ([message data cause]
+   (throw (ex-info message (merge {::message message} data) cause))))
 
 (defn file-exists? [path]
   (.exists (file path)))
@@ -43,14 +46,19 @@
     (catch clojure.lang.ExceptionInfo e
       false)))
 
-(defmacro ruby-bin [project-dir command & opts]
-  `(try
-     (with-programs [~command bundle]
-       (let [gemfile (file ~project-dir "Gemfile")]
+(defn ruby-bin [project-dir command & opts]
+  (try
+     (with-programs [env bundle]
+       (let [gemfile (file project-dir "Gemfile")
+             opts (into (vec opts) [{:dir project-dir}])]
          (if (.exists gemfile)
-           (bundle "exec" ~@opts)
-           (~command ~@opts))))
-     (catch clojure.lang.ExceptionInfo e)))
+           (println (apply bundle "exec" command opts))
+           (println (apply env command opts)))))
+     (catch clojure.lang.ExceptionInfo e
+       (let [command-line (string/join " " (into [command] opts))
+             output (string/join "\n" (-> (ex-data e) :proc :err))
+             msg (str "Error running ruby command: " command-line "\n" output)]
+         (throw (runtime-error msg (ex-data e) e))))))
 
 (defn berks [project-dir]
   (let [berksfile (file project-dir "Berksfile")
@@ -60,8 +68,8 @@
       (with-programs [bundle berks rm]
         (rm {:dir project-dir} "-rf" "site-cookbooks")
         (cond
-          (.exists gemfile) (bundle {:dir project-dir} "exec" "berks" "vendor" "site-cookbooks")
-          :else             (berks {:dir project-dir} "vendor" "site-cookbooks"))))))
+          (.exists gemfile) (bundle "exec" "berks" "vendor" "site-cookbooks" {:dir project-dir})
+          :else             (berks "vendor" "site-cookbooks" {:dir project-dir}))))))
 
 (defn config-error [explain-data]
   (str "Expected "
@@ -91,7 +99,8 @@
 (defmulti task (fn [command & args] command))
 (defmethod task :init
   [command options]
-  (println "INIT"))
+  (println "INIT")
+  (println (ruby-bin (:project-dir options) "berks" "init" (:project-dir options))))
 (defmethod task :deploy
   [command options]
   (println "DEPLOY"))
