@@ -1,0 +1,132 @@
+#!/usr/bin/env boot
+
+(set-env! :dependencies '[[me.raynes/conch "0.8.0"]
+                          [org.clojure/clojure "1.9.0-alpha16"]])
+(require '[me.raynes.conch :refer [with-programs] :as sh]
+         '[clojure.edn :as edn]
+         '[clojure.string :as string]
+         '[clojure.spec.alpha :as s]
+         '[clojure.java.io :refer [file]]
+         '[boot.cli :refer [defclifn]])
+
+;;
+;; Configuration Spec
+;;
+(s/def ::string string?)
+(s/def ::integer integer?)
+(s/def ::host ::string)
+(s/def ::user ::string)
+(s/def ::port ::integer)
+(s/def ::recipe ::string)
+(s/def ::run-list (s/coll-of ::recipe))
+
+(def config-spec (s/keys :opt-un [::host
+                                  ::user
+                                  ::run-list
+                                  ::port]))
+
+(defn runtime-error
+  ([message]
+   (runtime-error message {}))
+  ([message data]
+   (throw (ex-info message (merge {::message message}
+                                  data)))))
+
+(defn file-exists? [path]
+  (.exists (file path)))
+
+(defn command-exists? [cmd]
+  (try
+    (with-programs [which]
+      (which cmd)
+      true)
+    (catch clojure.lang.ExceptionInfo e
+      false)))
+
+(defmacro ruby-bin [project-dir command & opts]
+  `(try
+     (with-programs [~command bundle]
+       (let [gemfile (file ~project-dir "Gemfile")]
+         (if (.exists gemfile)
+           (bundle "exec" ~@opts)
+           (~command ~@opts))))
+     (catch clojure.lang.ExceptionInfo e)))
+
+(defn berks [project-dir]
+  (let [berksfile (file project-dir "Berksfile")
+        gemfile   (file project-dir "Gemfile")]
+    (if (and (.exists berksfile) (or (command-exists? "berks")
+                                     (command-exists? "bundle")))
+      (with-programs [bundle berks rm]
+        (rm {:dir project-dir} "-rf" "site-cookbooks")
+        (cond
+          (.exists gemfile) (bundle {:dir project-dir} "exec" "berks" "vendor" "site-cookbooks")
+          :else             (berks {:dir project-dir} "vendor" "site-cookbooks"))))))
+
+(defn config-error [explain-data]
+  (str "Expected "
+       (-> explain-data :path first)
+       " to conform to "
+       (-> explain-data :pred)
+       " but got "
+       (-> explain-data :val)))
+
+(defn validate-config [f config-edn]
+  (if (s/valid? config-spec config-edn)
+    (s/conform config-spec config-edn)
+    (let [explain-data (s/explain-data config-spec config-edn)
+          header       (str "Delivery configuration file \"" f "\" is invalid")]
+      (runtime-error (str header
+                          "\n"
+                          (string/join (repeat (count header) "-"))
+                          "\n"
+                          (string/join "\n" (map config-error (:clojure.spec.alpha/problems explain-data))))))))
+
+(defn read-config [f]
+  (if (.exists f)
+    (let [config-edn (edn/read-string (slurp f))]
+      (validate-config f config-edn))
+    (runtime-error (str "Configuration file \"" f "\" doesn't exist"))))
+
+(defmulti task (fn [command & args] command))
+(defmethod task :init
+  [command options]
+  (println "INIT"))
+(defmethod task :deploy
+  [command options]
+  (println "DEPLOY"))
+
+(defclifn -main
+  "A simple server provisioning tool using Chef Zero"
+  [_ host HOST str "specify the host to deploy to"
+   p port PORT str "specify the port to use for SSH (default 22)"
+   c config CONFIG str "the config file to read (default delivery.edn)"
+   r run-list RUN_LIST str "the run-list to execute on HOST"
+   u user USER str "the user to deploy as (default root)"]
+  (try
+    (let [command (-> (first *args*) keyword)]
+      (if (get-method task command)
+        (let [config-file (file (or config "delivery.edn"))
+              project-dir (.. config-file getAbsoluteFile getParent)
+              config      (read-config config-file)]
+          (let [host     (or host (:host config))
+                port     (or port (:port config) 22)
+                run-list (or run-list (:run-list config))
+                user     (or user (:user config) "root")
+
+                options {:host        host
+                         :port        port
+                         :run-list    run-list
+                         :user        user
+                         :project-dir project-dir
+                         :config-file config-file}]
+            (println (str "Deploying to " host ":" port))
+            (println "Deploying as" user)
+            (println "Project dir" project-dir)
+            (task command options)))
+        (*usage*)))
+    (catch clojure.lang.ExceptionInfo e
+      (let [d (-> e ex-data)]
+        (if (::message d)
+          (println (::message d))
+          (throw e))))))
