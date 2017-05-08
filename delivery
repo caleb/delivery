@@ -2,14 +2,20 @@
 
 (set-env! :dependencies '[[me.raynes/conch "0.8.0"]
                           [org.clojure/core.incubator "0.1.4"]
+                          [org.clojure/data.json "0.2.6"]
+                          [clj-ssh "0.5.14"]
                           [org.clojure/clojure "1.9.0-alpha16"]])
+(import [java.nio.file Files])
 (require '[me.raynes.conch :refer [with-programs]]
          '[me.raynes.conch.low-level :as sh]
          '[clojure.edn :as edn]
          '[clojure.string :as string]
+         '[clojure.data.json :as json]
+         '[clojure.pprint :as pprint]
          '[clojure.spec.alpha :as s]
+         '[clj-ssh.ssh :as ssh]
          '[clojure.core.strint :refer [<<]]
-         '[clojure.java.io :refer [file spit]]
+         '[clojure.java.io :refer [file]]
          '[boot.cli :refer [defclifn]])
 
 ;;
@@ -21,11 +27,15 @@
 (s/def ::user ::string)
 (s/def ::port ::integer)
 (s/def ::recipe ::string)
+(s/def ::remote-dir ::string)
 (s/def ::run-list (s/coll-of ::recipe))
+(s/def ::attributes map?)
 
 (def config-spec (s/keys :opt-un [::host
                                   ::user
                                   ::run-list
+                                  ::remote-dir
+                                  ::attributes
                                   ::port]))
 
 (defn runtime-error
@@ -74,54 +84,144 @@
       (validate-config f config-edn))
     (runtime-error (str "Configuration file \"" f "\" doesn't exist"))))
 
-(defn create-context [options args]
-  (let [config-file (file (or (:config options)))
+(defn ssh-command [context]
+  (let [port (:port context)
+        user (:user context)
+        host (:host context)]
+    (<< "ssh -p ~{port} ~{user}@~{host}")))
+
+(defn create-context [command options args]
+  (let [config-file (file (or (:config options) "delivery.edn"))
         project-dir (.. config-file getAbsoluteFile getParent)
         config      (read-config config-file)]
-    {:command     (first args)
-     :args        (rest args)
+    {:command     command
+     :args        args
      :host        (or (:host options) (:host config))
-     :port        (or (:port options) (:port config))
+     :port        (or (:port options) (:port config) "22")
      :run-list    (or (:run-list options) (:run-list config))
-     :user        (or (:user options) (:user config))
+     :user        (or (:user options) (:user config) "root")
+     :remote-dir  (or (:remote-dir options) (:remote-dir config) "/chef")
+     :attributes  (:attributes config)
      :config-file config-file
      :project-dir project-dir}))
 
+(defn ssh [context & commands]
+  (let [user    (:user context)
+        host    (:host context)
+        port    (:port context)
+        script (string/join "\n" commands)]
+    (with-programs [ssh]
+      (let [proc (sh/proc "ssh" "-p" (str port) (<< "~{user}@~{host}") "--" "/bin/sh" "-s")]
+        (sh/feed-from-string proc script)
+        (sh/done proc)
+        (loop [line (sh/read-line proc :out)]
+          (println line)
+          (when-let [next-line (sh/read-line proc :out)]
+            (recur next-line)))))))
+
 (defmulti task (fn [command & args] command))
 (defmethod task :init
-  [options args]
-  (println "INIT")
-  (let [command      (first args)
-        target-dir   (second args)
-        project-dir  (file target-dir)
-        project-name (.getName project-dir)]
-    (write-if-missing (file (:project-dir context) "Policyfile.rb")
+  [command options args]
+  (when-not (and (command-exists? "knife")
+                 (command-exists? "chef"))
+    (runtime-error "You must have knife and chef installed.
+You can install these with the Chef Development Kit:
+https://downloads.chef.io/chefdk"))
+  (let [target-dir       (first args)
+        project-dir      (-> target-dir file .getCanonicalFile)
+        project-name     (.getName project-dir)
+        cookbooks-dir    (file project-dir "cookbooks")
+        app-cookbook-dir (file cookbooks-dir project-name)]
+    (when-not (.exists project-dir)
+      (println (<< "Creating project directory ~{project-dir}"))
+      (.mkdirs project-dir))
+    (when-not (.exists cookbooks-dir)
+      (println (<< "Creating cookbooks directory: ~{cookbooks-dir}"))
+      (.mkdirs cookbooks-dir))
+    (when-not (.exists app-cookbook-dir)
+      (println (<< "Creating cookbook: ~{app-cookbook-dir}"))
+      (with-programs [knife]
+        (println (knife "cookbook" "create" project-name "-o" cookbooks-dir))))
+    (write-if-missing (file project-dir "delivery.edn")
+                      (let [s (java.io.StringWriter.)]
+                        (pprint/pprint (cond-> {:host (or (:host options) "")
+                                                :port (or (:port options) 22)
+                                                :user (or (:user options) "root")
+                                                :remote-dir (or (:remote-dir options) "/chef")
+                                                :attributes {:meat-and-potatoes {:swap {:size 1024}
+                                                                                 :firewall {:ports [22 80 443]}}}}
+                                         (:run-list options) (assoc :run-list (:run-list options)))
+                                       s)
+                        (.toString s)))
+    (write-if-missing (file project-dir "Policyfile.rb")
                       (<< "name '~{project-name}'\n"
-                          "run_list '~{project-name::default}'\n"
+                          "run_list 'recipe[meat-and-potatoes::default]', 'recipe[~{project-name}::default]'\n"
                           "default_source :supermarket\n"
-                          "cookbook '~{project-name}', '~> 0.1.0', path: 'cookbooks/~{project-name}'"))))
+                          "cookbook '~{project-name}', '~> 0.1.0', path: 'cookbooks/~{project-name}'\n"
+                          "cookbook 'meat-and-potatoes', '~> 1.0.0', github: 'caleb/meat-and-potatoes', branch: 'master'"))))
+
+(defmethod task :bootstrap
+  [command options args]
+  (let [context (create-context command options args)]
+    (ssh context
+         "apt-get update"
+         "apt-get install -y curl rsync"
+         "curl 'https://packages.chef.io/files/stable/chef/13.0.118/debian/8/chef_13.0.118-1_amd64.deb' > /tmp/chef.deb"
+         "dpkg -i /tmp/chef.deb")))
+
+(defmethod task :ssh
+  [command options args]
+  (let [context (create-context command options args)]
+    (println (ssh-command context))))
 
 (defmethod task :deploy
-  [options args]
-  (let [context (create-context options args)]
-    (println "DEPLOY")))
+  [command options args]
+  (let [context (create-context command options args)
+        project-dir (file (:project-dir context))
+        policy-file (file project-dir "Policyfile.rb")
+        order-dir (Files/createTempDirectory (.toPath project-dir) "order" (into-array java.nio.file.attribute.FileAttribute []))]
+    (with-programs [chef rm]
+      (try
+        (println "Packaging the order")
+        (println (chef "install" policy-file))
+        (println (chef "export" policy-file order-dir))
+        (println "Generating attributes file")
+        (if (map? (:attributes context))
+          (write-if-missing (file (.toFile order-dir) "attributes.json")
+                            (json/write-str (:attributes context))))
+        (finally
+          (when-not (:keep-order options)
+            (println "Cleaning up order directory" (.. order-dir toString))
+            (rm "-rf" order-dir)))))))
 
 (defclifn -main
-  "A simple server provisioning tool using Chef Zero"
-  [_ host HOST str "specify the host to deploy to"
-   p port PORT str "specify the port to use for SSH (default 22)"
-   c config CONFIG str "the config file to read (default delivery.edn)"
-   r run-list RUN_LIST str "the run-list to execute on HOST"
-   u user USER str "the user to deploy as (default root)"]
+  "A simple server provisioning tool using Chef Zero
+
+  Usage: delivery <OPTIONS> <COMMAND> <ARGUMENTS>
+
+  Commands:
+    init <dir>: initialize a new delivery project in <dir>
+    deploy: converge the remote host
+    ssh: open an ssh session to the remote host"
+  [_ host       HOST        str  "specify the host to deploy to"
+   p port       PORT        str  "specify the port to use for SSH (default 22)"
+   c config     CONFIG      str  "the config file to read (default delivery.edn)"
+   r run-list   RUNLIST    [str] "the run-list to execute on HOST"
+   _ remote-dir REMOTEDIR   str  "the directory where the chef project will be copied on the remote"
+   k keep-order             bool "keep the order directory in the project folder after deployment (default false)"
+   u user       USER        str  "the user to deploy as (default root)"]
   (try
     (let [command (-> (first *args*) keyword)
+          args (rest *args*)
           options {:host host
                    :port port
                    :config config
                    :run-list run-list
+                   :remote-dir remote-dir
+                   :keep-order (or keep-order false)
                    :user user}]
       (if (get-method task command)
-        (task options *args*)
+        (task command options args)
         (*usage*)))
     (catch clojure.lang.ExceptionInfo e
       (let [d (-> e ex-data)]
