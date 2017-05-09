@@ -5,7 +5,8 @@
                           [org.clojure/data.json "0.2.6"]
                           [clj-ssh "0.5.14"]
                           [org.clojure/clojure "1.9.0-alpha16"]])
-(import [java.nio.file Files])
+(import [java.nio.file Files]
+        [java.io BufferedWriter BufferedReader StringWriter PipedReader PipedWriter])
 (require '[me.raynes.conch :refer [with-programs]]
          '[me.raynes.conch.low-level :as sh]
          '[clojure.edn :as edn]
@@ -106,18 +107,55 @@
      :project-dir project-dir}))
 
 (defn ssh [context & commands]
-  (let [user    (:user context)
-        host    (:host context)
-        port    (:port context)
-        script (string/join "\n" commands)]
+  (let [user   (:user context)
+        host   (:host context)
+        port   (:port context)
+        script (string/join "\n" commands)
+        pr     (PipedReader.)
+        pw     (PipedWriter. pr)
+        br     (BufferedReader. pr)
+        ;; bw     (BufferedWriter. pw)
+        ]
     (with-programs [ssh]
       (let [proc (sh/proc "ssh" "-p" (str port) (<< "~{user}@~{host}") "--" "/bin/sh" "-s")]
         (sh/feed-from-string proc script)
         (sh/done proc)
-        (loop [line (sh/read-line proc :out)]
-          (println line)
-          (when-let [next-line (sh/read-line proc :out)]
-            (recur next-line)))))))
+        (future (sh/stream-to proc :out pw))
+        (let [lines (line-seq br)]
+          (loop [line  (first lines)
+                 lines (rest lines)]
+            (println line)
+            (recur (first lines) (rest lines)))
+          #_(loop [line  (read-line br)
+                   lines []]
+              (if line
+                (do
+                  (println line)
+                  (recur (read-line br) (conj lines line)))
+                [lines])))
+        (println "OH HAI")
+        (sh/destroy proc)
+        [(== (sh/exit-code proc) 0) []]
+        #_(let [[proc lines] (loop [buffer (StringWriter.)
+                                    lines  []]
+                               ;; (sh/stream-to proc :out buffer)
+                               ;; (println line)
+                               (if-let []
+                                 (recur next-line (conj lines (str line)))
+                                 [proc (conj lines (str line))]))]
+            [(== (sh/exit-code proc) 0) lines])))))
+
+(defn rsync-to-remote [context order-dir]
+  (with-programs [rsync]
+    (let [port                 (:port context)
+          user                 (:user context)
+          host                 (:host context)
+          remote-dir           (:remote-dir context)
+          order-dir-with-slash (str order-dir "/")
+          ssh-command          (<< "ssh -p ~{port}")
+          rsh-flag             (<< "--rsh=~{ssh-command}")
+          remote-target        (<< "~{user}@~{host}:~{remote-dir}")]
+      (println (rsync "-a" rsh-flag order-dir-with-slash remote-target)))))
 
 (defmulti task (fn [command & args] command))
 (defmethod task :init
@@ -162,12 +200,13 @@ https://downloads.chef.io/chefdk"))
 
 (defmethod task :bootstrap
   [command options args]
-  (let [context (create-context command options args)]
+  (let [context              (create-context command options args)
+        chef-version         (:chef-version options)
+        chef-install-options (when chef-version (<< " -- -v ~{chef-version}"))]
     (ssh context
          "apt-get update"
          "apt-get install -y curl rsync"
-         "curl 'https://packages.chef.io/files/stable/chef/13.0.118/debian/8/chef_13.0.118-1_amd64.deb' > /tmp/chef.deb"
-         "dpkg -i /tmp/chef.deb")))
+         (<< "curl -L 'https://omnitruck.chef.io/install.sh' | /bin/sh -s~{chef-install-options}"))))
 
 (defmethod task :ssh
   [command options args]
@@ -176,10 +215,11 @@ https://downloads.chef.io/chefdk"))
 
 (defmethod task :deploy
   [command options args]
-  (let [context (create-context command options args)
+  (let [context     (create-context command options args)
         project-dir (file (:project-dir context))
+        remote-dir  (file (:remote-dir context))
         policy-file (file project-dir "Policyfile.rb")
-        order-dir (Files/createTempDirectory (.toPath project-dir) "order" (into-array java.nio.file.attribute.FileAttribute []))]
+        order-dir   (Files/createTempDirectory (.toPath project-dir) "order" (into-array java.nio.file.attribute.FileAttribute []))]
     (with-programs [chef rm]
       (try
         (println "Packaging the order")
@@ -189,6 +229,24 @@ https://downloads.chef.io/chefdk"))
         (if (map? (:attributes context))
           (write-if-missing (file (.toFile order-dir) "attributes.json")
                             (json/write-str (:attributes context))))
+        (rsync-to-remote context order-dir)
+        (let [[success? output] (ssh context
+                                     (<< "cd ~{remote-dir}")
+                                     "chef-client --json-attributes=attributes.json -z")]
+          (when-not success?
+            ;; look through the lines for a chef stacktrace and print it
+            (loop [other (rest output)
+                   line  (first output)]
+              (let [match (re-matches #"\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}-\d{2}:\d{2}\] FATAL: Stacktrace dumped to (.*)" line)]
+                (when match
+                  (println (<< "\n\nChef Stacktrace (~(second match))\n\n"))
+                  (ssh context
+                       "echo HI"
+                       (<< "cat /tmp/delivery-deploy.sh")
+                       (<< "cat /tmp/delivery-deploy.sh")
+                       (<< "cat ~(second match)")))
+                (if (and (nil? match) (rest output))
+                  (recur (rest other) (first other)))))))
         (finally
           (when-not (:keep-order options)
             (println "Cleaning up order directory" (.. order-dir toString))
@@ -202,24 +260,27 @@ https://downloads.chef.io/chefdk"))
   Commands:
     init <dir>: initialize a new delivery project in <dir>
     deploy: converge the remote host
+    bootstrap: install curl, rsync and chef-client on the remote host
     ssh: open an ssh session to the remote host"
-  [_ host       HOST        str  "specify the host to deploy to"
-   p port       PORT        str  "specify the port to use for SSH (default 22)"
-   c config     CONFIG      str  "the config file to read (default delivery.edn)"
-   r run-list   RUNLIST    [str] "the run-list to execute on HOST"
-   _ remote-dir REMOTEDIR   str  "the directory where the chef project will be copied on the remote"
-   k keep-order             bool "keep the order directory in the project folder after deployment (default false)"
-   u user       USER        str  "the user to deploy as (default root)"]
+  [_ host         HOST        str  "the host to deploy to"
+   p port         PORT        str  "the port to use for SSH (default 22)"
+   c config       CONFIG      str  "the config file to read (default delivery.edn)"
+   r run-list     RUNLIST    [str] "the run-list to execute on HOST"
+   _ remote-dir   REMOTEDIR   str  "the directory of the order on the remote (default /chef)"
+   k keep-order               bool "keep the order directory after deployment (default false)"
+   u user         USER        str  "the user to deploy as (default root)"
+   _ chef-version CHEFVERSION str  "the version of chef-client to install on bootstrap (default newest stable version)"]
   (try
     (let [command (-> (first *args*) keyword)
-          args (rest *args*)
-          options {:host host
-                   :port port
-                   :config config
-                   :run-list run-list
-                   :remote-dir remote-dir
-                   :keep-order (or keep-order false)
-                   :user user}]
+          args    (rest *args*)
+          options {:host         host
+                   :port         port
+                   :config       config
+                   :run-list     run-list
+                   :chef-version chef-version
+                   :remote-dir   remote-dir
+                   :keep-order   (or keep-order false)
+                   :user         user}]
       (if (get-method task command)
         (task command options args)
         (*usage*)))
