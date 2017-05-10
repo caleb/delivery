@@ -4,20 +4,32 @@
                           [org.clojure/core.incubator "0.1.4"]
                           [org.clojure/data.json "0.2.6"]
                           [clj-ssh "0.5.14"]
+                          [commons-io/commons-io "2.5"]
+                          [clojure-term-colors "0.1.0-SNAPSHOT"]
                           [org.clojure/clojure "1.9.0-alpha16"]])
 (import [java.nio.file Files]
-        [java.io BufferedWriter BufferedReader StringWriter PipedReader PipedWriter])
+        [org.apache.commons.io.output TeeOutputStream]
+        [java.io StringWriter ByteArrayOutputStream])
 (require '[me.raynes.conch :refer [with-programs]]
          '[me.raynes.conch.low-level :as sh]
          '[clojure.edn :as edn]
          '[clojure.string :as string]
          '[clojure.data.json :as json]
          '[clojure.pprint :as pprint]
+         '[clojure.term.colors :as colors]
          '[clojure.spec.alpha :as s]
          '[clj-ssh.ssh :as ssh]
          '[clojure.core.strint :refer [<<]]
          '[clojure.java.io :refer [file]]
          '[boot.cli :refer [defclifn]])
+
+;; The default policy file template
+(defn policy-file-template [project-name options]
+  (<< "name '~{project-name}'\n"
+      "run_list 'recipe[meat-and-potatoes::default]', 'recipe[~{project-name}::default]'\n"
+      "default_source :supermarket\n"
+      "cookbook '~{project-name}', '~> 0.1.0', path: 'cookbooks/~{project-name}'\n"
+      "cookbook 'meat-and-potatoes', '~> 1.0.0', github: 'caleb/meat-and-potatoes', branch: 'master'"))
 
 ;;
 ;; Configuration Spec
@@ -27,14 +39,11 @@
 (s/def ::host ::string)
 (s/def ::user ::string)
 (s/def ::port ::integer)
-(s/def ::recipe ::string)
 (s/def ::remote-dir ::string)
-(s/def ::run-list (s/coll-of ::recipe))
 (s/def ::attributes map?)
 
 (def config-spec (s/keys :opt-un [::host
                                   ::user
-                                  ::run-list
                                   ::remote-dir
                                   ::attributes
                                   ::port]))
@@ -68,16 +77,46 @@
        " but got "
        (-> explain-data :val)))
 
+(defn print-header
+  ([header color-fn]
+   (let [divider (color-fn (string/join (repeat (count header) "=")))]
+     (print (<< "\n"
+                "~{divider}\n"
+                "~(color-fn header)\n"
+                "~{divider}\n"
+                "\n"))))
+  ([header]
+   (let [divider (string/join (repeat (count header) "="))]
+     (print "\n")
+     (println divider)
+     (println header)
+     (println divider)
+     (print "\n"))))
+
+(defn header-str
+  ([header]
+   (let [divider (string/join (repeat (count header) "="))]
+     (<< "\n"
+         "~{divider}\n"
+         "~{header}\n"
+         "~{divider}\n"
+         "\n")))
+  ([header color-fn]
+   (let [divider (color-fn (string/join (repeat (count header) "=")))]
+     (<< "\n"
+         "~{divider}\n"
+         "~(color-fn header)\n"
+         "~{divider}\n"
+         "\n"))))
+
 (defn validate-config [f config-edn]
   (if (s/valid? config-spec config-edn)
     (s/conform config-spec config-edn)
     (let [explain-data (s/explain-data config-spec config-edn)
-          header       (str "Delivery configuration file \"" f "\" is invalid")]
-      (runtime-error (str header
-                          "\n"
-                          (string/join (repeat (count header) "-"))
-                          "\n"
-                          (string/join "\n" (map config-error (:clojure.spec.alpha/problems explain-data))))))))
+          header       (header-str (<< "Delivery configuration file \"~{f}\" is invalid"))
+          errors       (string/join "\n" (map config-error (:clojure.spec.alpha/problems explain-data)))]
+      (runtime-error (<< "~{header}\n"
+                         "~{errors}")))))
 
 (defn read-config [f]
   (if (.exists f)
@@ -111,39 +150,16 @@
         host   (:host context)
         port   (:port context)
         script (string/join "\n" commands)
-        pr     (PipedReader.)
-        pw     (PipedWriter. pr)
-        br     (BufferedReader. pr)
-        ;; bw     (BufferedWriter. pw)
-        ]
+        baos   (ByteArrayOutputStream.)
+        out    System/out
+        tee    (TeeOutputStream. baos out)]
     (with-programs [ssh]
       (let [proc (sh/proc "ssh" "-p" (str port) (<< "~{user}@~{host}") "--" "/bin/sh" "-s")]
         (sh/feed-from-string proc script)
         (sh/done proc)
-        (future (sh/stream-to proc :out pw))
-        (let [lines (line-seq br)]
-          (loop [line  (first lines)
-                 lines (rest lines)]
-            (println line)
-            (recur (first lines) (rest lines)))
-          #_(loop [line  (read-line br)
-                   lines []]
-              (if line
-                (do
-                  (println line)
-                  (recur (read-line br) (conj lines line)))
-                [lines])))
-        (println "OH HAI")
+        (sh/stream-to proc :out tee)
         (sh/destroy proc)
-        [(== (sh/exit-code proc) 0) []]
-        #_(let [[proc lines] (loop [buffer (StringWriter.)
-                                    lines  []]
-                               ;; (sh/stream-to proc :out buffer)
-                               ;; (println line)
-                               (if-let []
-                                 (recur next-line (conj lines (str line)))
-                                 [proc (conj lines (str line))]))]
-            [(== (sh/exit-code proc) 0) lines])))))
+        [(== (sh/exit-code proc) 0) (string/split (.toString baos "UTF-8") #"\n")]))))
 
 (defn rsync-to-remote [context order-dir]
   (with-programs [rsync]
@@ -167,7 +183,7 @@ You can install these with the Chef Development Kit:
 https://downloads.chef.io/chefdk"))
   (let [target-dir       (first args)
         project-dir      (-> target-dir file .getCanonicalFile)
-        project-name     (.getName project-dir)
+        project-name     (or (second args) (.getName project-dir))
         cookbooks-dir    (file project-dir "cookbooks")
         app-cookbook-dir (file cookbooks-dir project-name)]
     (when-not (.exists project-dir)
@@ -187,16 +203,24 @@ https://downloads.chef.io/chefdk"))
                                                 :user (or (:user options) "root")
                                                 :remote-dir (or (:remote-dir options) "/chef")
                                                 :attributes {:meat-and-potatoes {:swap {:size 1024}
-                                                                                 :firewall {:ports [22 80 443]}}}}
+                                                                                 :firewall {:ports [22 80 443]}
+                                                                                 :ssh_known_hosts ["github.com" "bitbucket.org"]}}}
                                          (:run-list options) (assoc :run-list (:run-list options)))
                                        s)
                         (.toString s)))
     (write-if-missing (file project-dir "Policyfile.rb")
-                      (<< "name '~{project-name}'\n"
-                          "run_list 'recipe[meat-and-potatoes::default]', 'recipe[~{project-name}::default]'\n"
-                          "default_source :supermarket\n"
-                          "cookbook '~{project-name}', '~> 0.1.0', path: 'cookbooks/~{project-name}'\n"
-                          "cookbook 'meat-and-potatoes', '~> 1.0.0', github: 'caleb/meat-and-potatoes', branch: 'master'"))))
+                      (policy-file-template project-name options))))
+
+(defmethod task :update
+  [command options args]
+  (when-not (command-exists? "chef")
+    (runtime-error "You must have knife and chef installed.
+You can install these with the Chef Development Kit:
+https://downloads.chef.io/chefdk"))
+  (let [context     (create-context command options args)
+        policy-file (file (:project-dir context) "Policyfile.rb")]
+    (with-programs [chef]
+      (println (chef "update" policy-file)))))
 
 (defmethod task :bootstrap
   [command options args]
@@ -232,18 +256,17 @@ https://downloads.chef.io/chefdk"))
         (rsync-to-remote context order-dir)
         (let [[success? output] (ssh context
                                      (<< "cd ~{remote-dir}")
-                                     "chef-client --json-attributes=attributes.json -z")]
+                                     ;; Delete all of the  existing nodes so we can re-run with new attributes
+                                     "knife node bulk delete '.*' -y -z > /dev/null"
+                                     (<< "chef-client --json-attributes=attributes.json -z"))]
           (when-not success?
             ;; look through the lines for a chef stacktrace and print it
             (loop [other (rest output)
                    line  (first output)]
               (let [match (re-matches #"\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}-\d{2}:\d{2}\] FATAL: Stacktrace dumped to (.*)" line)]
                 (when match
-                  (println (<< "\n\nChef Stacktrace (~(second match))\n\n"))
+                  (print-header (<< "Chef Stacktrace (~(second match))") colors/red)
                   (ssh context
-                       "echo HI"
-                       (<< "cat /tmp/delivery-deploy.sh")
-                       (<< "cat /tmp/delivery-deploy.sh")
                        (<< "cat ~(second match)")))
                 (if (and (nil? match) (rest output))
                   (recur (rest other) (first other)))))))
@@ -258,7 +281,9 @@ https://downloads.chef.io/chefdk"))
   Usage: delivery <OPTIONS> <COMMAND> <ARGUMENTS>
 
   Commands:
-    init <dir>: initialize a new delivery project in <dir>
+    init <dir> [name]: initialize a new delivery project in <dir> with the project name [name]
+                       defaults to using the filename of <dir> as the project name
+    update: runs chef update to emit a new Policyfile.lock.json
     deploy: converge the remote host
     bootstrap: install curl, rsync and chef-client on the remote host
     ssh: open an ssh session to the remote host"
