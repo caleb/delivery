@@ -154,7 +154,7 @@
         out    System/out
         tee    (TeeOutputStream. baos out)]
     (with-programs [ssh]
-      (let [proc (sh/proc "ssh" "-p" (str port) (<< "~{user}@~{host}") "--" "/bin/sh" "-s")]
+      (let [proc (sh/proc "ssh" "-A" "-p" (str port) (<< "~{user}@~{host}") "--" "/bin/sh" "-s")]
         (sh/feed-from-string proc script)
         (sh/done proc)
         (sh/stream-to proc :out tee)
