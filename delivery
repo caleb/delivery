@@ -258,7 +258,7 @@ https://downloads.chef.io/chefdk"))
                                      (<< "cd ~{remote-dir}")
                                      ;; Delete all of the  existing nodes so we can re-run with new attributes
                                      "knife node bulk delete '.*' -y -z > /dev/null"
-                                     (<< "chef-client --json-attributes=attributes.json -z"))]
+                                     (<< "chef-client --json-attributes=/chef/attributes.json -z"))]
           (when-not success?
             ;; look through the lines for a chef stacktrace and print it
             (loop [other (rest output)
