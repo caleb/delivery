@@ -194,8 +194,8 @@ https://downloads.chef.io/chefdk"))
       (.mkdirs cookbooks-dir))
     (when-not (.exists app-cookbook-dir)
       (println (<< "Creating cookbook: ~{app-cookbook-dir}"))
-      (with-programs [knife]
-        (println (knife "cookbook" "create" project-name "-o" cookbooks-dir))))
+      (with-programs [chef]
+        (println (chef "generate" "cookbook" project-name {:dir cookbooks-dir}))))
     (write-if-missing (file project-dir "delivery.edn")
                       (let [s (java.io.StringWriter.)]
                         (pprint/pprint (cond-> {:host (or (:host options) "")
