@@ -243,16 +243,23 @@ https://downloads.chef.io/chefdk"))
         project-dir (file (:project-dir context))
         remote-dir  (file (:remote-dir context))
         policy-file (file project-dir "Policyfile.rb")
-        order-dir   (Files/createTempDirectory (.toPath project-dir) "order" (into-array java.nio.file.attribute.FileAttribute []))]
+        order-dir   (Files/createTempDirectory (.toPath project-dir) "order" (into-array java.nio.file.attribute.FileAttribute []))
+
+        secrets     (file (or (:secrets context) "secrets.edn"))
+
+        attributes  (or (:attributes context) {})
+        attributes  (if (.exists secrets)
+                      (merge {:secrets (edn/read-string (slurp secrets))} attributes)
+                      attributes)]
     (with-programs [chef rm]
       (try
         (println "Packaging the order")
         (println (chef "install" policy-file))
         (println (chef "export" policy-file order-dir))
         (println "Generating attributes file")
-        (if (map? (:attributes context))
+        (if (map? attributes)
           (write-if-missing (file (.toFile order-dir) "attributes.json")
-                            (json/write-str (:attributes context))))
+                            (json/write-str attributes)))
         (rsync-to-remote context order-dir)
         (let [[success? output] (ssh context
                                      (<< "cd ~{remote-dir}")
