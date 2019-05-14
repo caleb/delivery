@@ -6,7 +6,7 @@
                           [clj-ssh "0.5.14"]
                           [commons-io/commons-io "2.5"]
                           [clojure-term-colors "0.1.0-SNAPSHOT"]
-                          [org.clojure/clojure "1.9.0"]])
+                          [org.clojure/clojure "1.10.0"]])
 (import [java.nio.file Files]
         [org.apache.commons.io.output TeeOutputStream]
         [java.io StringWriter ByteArrayOutputStream])
