@@ -39,11 +39,13 @@
 (s/def ::host ::string)
 (s/def ::user ::string)
 (s/def ::port ::integer)
+(s/def ::secrets ::string)
 (s/def ::remote-dir ::string)
 (s/def ::attributes map?)
 
 (def config-spec (s/keys :opt-un [::host
                                   ::user
+                                  ::secrets
                                   ::remote-dir
                                   ::attributes
                                   ::port]))
@@ -140,6 +142,7 @@
      :port        (or (:port options) (:port config) "22")
      :run-list    (or (:run-list options) (:run-list config))
      :user        (or (:user options) (:user config) "root")
+     :secrets     (or (:secrets options) (:secrets config) "secrets.edn")
      :remote-dir  (or (:remote-dir options) (:remote-dir config) "/chef")
      :attributes  (:attributes config)
      :config-file config-file
@@ -260,10 +263,11 @@ https://downloads.chef.io/chefdk"))
         (if (map? attributes)
           (write-if-missing (file (.toFile order-dir) "attributes.json")
                             (json/write-str attributes)))
+        (println "Uploading order to host")
         (rsync-to-remote context order-dir)
         (let [[success? output] (ssh context
                                      (<< "cd ~{remote-dir}")
-                                     ;; Delete all of the  existing nodes so we can re-run with new attributes
+                                     ;; Delete all of the existing nodes so we can re-run with new attributes
                                      "knife node bulk delete '.*' -y -z > /dev/null"
                                      (<< "chef-client --chef-license accept --json-attributes=~{remote-dir}/attributes.json -z"))]
           (when-not success?
@@ -297,6 +301,7 @@ https://downloads.chef.io/chefdk"))
   [_ host         HOST        str  "the host to deploy to"
    p port         PORT        str  "the port to use for SSH (default 22)"
    c config       CONFIG      str  "the config file to read (default delivery.edn)"
+   s secrets      SECRETS     str  "the secrets fiel (default secrets.edn)"
    r run-list     RUNLIST    [str] "the run-list to execute on HOST"
    _ remote-dir   REMOTEDIR   str  "the directory of the order on the remote (default /chef)"
    k keep-order               bool "keep the order directory after deployment (default false)"
